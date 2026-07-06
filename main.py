@@ -47,7 +47,7 @@ SIGNAL_COMPONENT = "az"  # options: "az", "el"
 MIN_SAMPLES_PER_TRIAL = 30
 
 # Set to an integer like 5 for a smoke test. Set to None for full run.
-MAX_BLOCKS = 5
+MAX_BLOCKS = None
 
 # IDTxl settings. These are deliberately conservative for a first pass.
 IDTXL_SETTINGS = {
