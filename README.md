@@ -39,48 +39,5 @@ Within each condition block, participants completed target-selection trials. Fra
 
 The data are not included directly in this repository unless otherwise stated.
 
-Current Status
-
-This repository is currently in the setup and replication stage. The immediate goals are:
-
-Install and test IDTxl.
-Load the frame-level gaze-interaction data.
-Reconstruct trial-level head and eye time series.
-Estimate transfer entropy in both directions:
-eye → head
-head → eye
-Aggregate results to the block level.
-Compare replicated results against the original analysis.
-Extend the analysis using partial information decomposition.
-Environment Setup
-
-This project is developed on Arch Linux using a Python virtual environment.
-
-Example setup:
-
-uv venv --python 3.11
-source .venv/bin/activate.fish
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install Cython numpy scipy matplotlib h5py networkx pandas jpype1 statsmodels
-
-Install IDTxl from source:
-
-git clone https://github.com/pwollstadt/IDTxl.git
-cd IDTxl
-python -m pip install -e . --no-build-isolation
-
-Test the installation:
-
-python -c "from idtxl.data import Data; from idtxl.bivariate_te import BivariateTE; from idtxl.bivariate_pid import BivariatePID; print('IDTxl import works')"
-Planned Repository Organization
-.
-├── data/                  # Local data files, ignored if large or private
-├── notebooks/             # Exploratory notebooks
-├── scripts/               # Analysis scripts
-├── results/               # Generated tables and figures
-├── docs/                  # Notes and documentation
-├── README.md
-└── .gitignore
-Notes
 
 This project is exploratory. Transfer entropy results should be interpreted carefully, especially when raw TE relationships weaken after shuffled-baseline correction or sample-length controls. The goal is not only to estimate information flow, but also to understand which parts of the signal reflect meaningful behavioural structure and which parts may reflect statistical artifacts.
