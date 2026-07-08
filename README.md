@@ -27,6 +27,8 @@ The main Python package used for information-theoretic analysis is:
 
 >IDTxl
 
+>https://github.com/pwollstadt/IDTxl
+
 # Dataset Structure
 
 The original dataset is expected to include frame-level and trial-level data. The relevant analysis unit is generally:
@@ -48,6 +50,28 @@ Transfer entropy is an information-theoretic measure of directional prediction b
 
 In simple terms, transfer entropy asks whether the past of one signal helps predict the current or future state of another signal, above and beyond what that second signal’s own past already predicts.
 
+The output of a transfer entropy analysis is usually a non-negative information value, often measured in bits or nats depending on the estimator. A larger transfer entropy value means that the past of the source signal provides more information about the target signal, after accounting for the target signal’s own past. A value close to zero means that the source signal adds little or no predictive information under the model being used.
+
+However, the raw transfer entropy value is not enough by itself. It needs to be evaluated statistically and interpreted carefully. In IDTxl, this is usually done through permutation testing. The source signal is shuffled or resampled to create a baseline distribution of transfer entropy values that could appear by chance. The observed transfer entropy is then compared against this null distribution. If the observed value is larger than what would usually be expected under the shuffled baseline, the source may be selected as statistically significant.
+
+A useful transfer entropy result should therefore be evaluated in several ways:
+
+```text
+1. Direction:
+   Is the information flow stronger from eye -> head or from head -> eye?
+
+2. Magnitude:
+   How large is the transfer entropy value?
+
+3. Statistical significance:
+   Is the result significant?
+
+4. Robustness:
+   Does the result remain after controlling for sample length, autocorrelation, layout, tracking mode, or other confounds?
+
+5. Interpretation:
+   Does the result plausibly reflect behavioural coordination, or could it be driven by noises in the time series?
+```
 
 ### Partial Information Decomposition
 
