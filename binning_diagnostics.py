@@ -32,30 +32,25 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 
 TRACKING_MODES = ["Bias", "BiasJitter"]
 
-# Pairwise yaw/pitch binning:
-# yaw has 3 bins, pitch has 3 bins, so each signal has 3 x 3 = 9 states.
 N_BINS_PER_DIM = 3
 N_STATES = N_BINS_PER_DIM * N_BINS_PER_DIM
 
-# Binning method:
-# "quantile" gives roughly balanced bins.
-# "equal_width" gives geometrically equal bins.
 BINNING_METHOD = "quantile"
 
-# Transfer entropy lag definition:
-# source_lag = 1 means source[t-1] -> target[t]
-# target_lag = 1 means target[t-1] controls for target's own past.
 SOURCE_LAG = 1
 TARGET_LAG = 1
 
 MIN_SAMPLES_PER_TRIAL = 30
 
-# Shuffled baseline for corrected TE and an approximate permutation p-value.
 N_SHUFFLES = 100
 RANDOM_SEED = 12345
 
-# Set to an integer for quick smoke test. Set to None for full run.
 MAX_BLOCKS = None
+
+# Important diagnostic setting:
+# If True, global bins are built only from the exact retained balanced blocks.
+# This avoids contaminating bin edges with excluded/repeated/incomplete blocks.
+STRICT_BALANCED_BINNING = True
 
 
 # ---------------------------------------------------------------------
@@ -74,6 +69,12 @@ def parse_source_session_id(source_sessions: str) -> str:
     if pd.isna(source_sessions):
         raise ValueError("Missing source_sessions value")
     return str(source_sessions).split(";")[0].strip()
+
+
+def parse_block_index(condition_block_key: str) -> int:
+    if "#block=" not in condition_block_key:
+        raise ValueError(f"Cannot parse block index from: {condition_block_key}")
+    return int(condition_block_key.split("#block=")[1].split("#")[0])
 
 
 def quaternion_to_forward_vector(
@@ -157,7 +158,6 @@ def make_bin_edges(values: np.ndarray, n_bins: int, method: str) -> np.ndarray:
         else:
             edges = np.linspace(vmin, vmax, n_bins + 1)
 
-    # Expand the outer edges slightly so boundary values are safely included.
     eps = 1e-9
     edges[0] -= eps
     edges[-1] += eps
@@ -172,18 +172,6 @@ def encode_2d_state(
     pitch_edges: np.ndarray,
     n_bins_per_dim: int,
 ) -> np.ndarray:
-    """
-    Convert continuous yaw/pitch values into one of 9 pairwise states.
-
-    If n_bins_per_dim = 3:
-
-        yaw_bin in {0, 1, 2}
-        pitch_bin in {0, 1, 2}
-
-    state = yaw_bin * 3 + pitch_bin
-
-    Therefore state is in {0, ..., 8}.
-    """
     yaw_bin = np.digitize(yaw, yaw_edges[1:-1], right=False)
     pitch_bin = np.digitize(pitch, pitch_edges[1:-1], right=False)
 
@@ -194,16 +182,178 @@ def encode_2d_state(
     return state.astype(int)
 
 
+def validate_accuracy_column(blocks: pd.DataFrame) -> pd.DataFrame:
+    out = blocks.copy()
+    out["computed_accuracy"] = out["correct_count"] / out["n_trials"]
+    out["accuracy_abs_diff"] = (out["accuracy"] - out["computed_accuracy"]).abs()
+    return out
+
+
+# ---------------------------------------------------------------------
+# Data-loading diagnostics
+# ---------------------------------------------------------------------
+
+def diagnose_frame_match(
+    frames: pd.DataFrame,
+    block_index: int,
+    layout: str,
+    tracking: str,
+    expected_n_trials: int,
+) -> dict[str, Any]:
+    """
+    Verify that the block-level row actually matches frame-level rows.
+    """
+    info: dict[str, Any] = {}
+
+    active = frames[frames["state"] == "TrialActive"].copy()
+
+    available_blocks = (
+        active.groupby(["block_index", "layout", "tracking"])["trial_index_in_block"]
+        .nunique()
+        .reset_index(name="n_trials_found")
+        .sort_values(["block_index", "layout", "tracking"])
+    )
+
+    expected_match = available_blocks[
+        (available_blocks["block_index"] == block_index)
+        & (available_blocks["layout"] == layout)
+        & (available_blocks["tracking"] == tracking)
+    ]
+
+    loaded_block = active[
+        (active["block_index"] == block_index)
+        & (active["layout"] == layout)
+        & (active["tracking"] == tracking)
+    ]
+
+    trial_values = sorted(
+        loaded_block["trial_index_in_block"].dropna().unique().tolist()
+    )
+
+    info["diagnostic_expected_match_found"] = not expected_match.empty
+    info["diagnostic_loaded_trialactive_rows"] = int(len(loaded_block))
+    info["diagnostic_loaded_n_trials"] = int(
+        loaded_block["trial_index_in_block"].nunique()
+    )
+    info["diagnostic_expected_n_trials"] = int(expected_n_trials)
+    info["diagnostic_trial_count_matches"] = (
+        info["diagnostic_loaded_n_trials"] == int(expected_n_trials)
+    )
+    info["diagnostic_loaded_trials"] = ";".join(str(x) for x in trial_values)
+
+    # This is only for console inspection.
+    if expected_match.empty:
+        log("  WARNING: expected block/layout/tracking not found in frame file")
+        log(f"  Expected block_index={block_index}, layout={layout}, tracking={tracking}")
+        log("  Available TrialActive blocks in this frame file:")
+        log(available_blocks.to_string(index=False))
+    else:
+        log("  Matched frame block:")
+        log(expected_match.to_string(index=False))
+
+    log(f"  Loaded TrialActive rows: {info['diagnostic_loaded_trialactive_rows']}")
+    log(f"  Loaded trials: {trial_values}")
+
+    if not info["diagnostic_trial_count_matches"]:
+        log(
+            "  WARNING: trial count mismatch: "
+            f"expected {expected_n_trials}, "
+            f"got {info['diagnostic_loaded_n_trials']}"
+        )
+
+    return info
+
+
 # ---------------------------------------------------------------------
 # Bin edge construction
 # ---------------------------------------------------------------------
 
-def collect_values_for_global_bins(blocks: pd.DataFrame) -> dict[str, np.ndarray]:
+def collect_values_from_exact_balanced_blocks(
+    blocks: pd.DataFrame,
+) -> dict[str, np.ndarray]:
     """
-    Collect active-frame eye/head yaw/pitch values from the selected blocks.
+    Strict version:
+    collect values only from exact participant/layout/tracking/block rows
+    in balanced_subject_block_summary.csv.
+    """
+    eye_az_values = []
+    eye_el_values = []
+    head_az_values = []
+    head_el_values = []
 
-    This creates global bin edges so that state 0-8 has the same meaning
-    across all blocks.
+    log("Collecting values for global bins from exact balanced block rows")
+
+    # Cache frame files so we do not repeatedly read the same CSV.
+    frame_cache: dict[str, pd.DataFrame] = {}
+
+    for i, row in blocks.iterrows():
+        source_session_id = parse_source_session_id(row["source_sessions"])
+        frame_path = frame_path_from_session_id(source_session_id)
+
+        block_index = parse_block_index(row["condition_block_key"])
+        layout = row["layout"]
+        tracking = row["tracking"]
+
+        if not frame_path.exists():
+            log(f"  Missing frame file during bin collection, skipping: {frame_path}")
+            continue
+
+        if source_session_id not in frame_cache:
+            if len(frame_cache) % 10 == 0:
+                log(f"  Reading frame file for bins: {frame_path.name}")
+            frame_cache[source_session_id] = pd.read_csv(frame_path)
+
+        frames = frame_cache[source_session_id]
+
+        active = frames[
+            (frames["state"] == "TrialActive")
+            & (frames["block_index"] == block_index)
+            & (frames["layout"] == layout)
+            & (frames["tracking"] == tracking)
+        ].copy()
+
+        if active.empty:
+            continue
+
+        active = add_head_az_el(active)
+
+        needed = [
+            "raw_panel_az_deg",
+            "raw_panel_el_deg",
+            "head_az_deg",
+            "head_el_deg",
+        ]
+
+        active = active[needed].dropna()
+
+        if active.empty:
+            continue
+
+        eye_az_values.append(active["raw_panel_az_deg"].to_numpy(dtype=float))
+        eye_el_values.append(active["raw_panel_el_deg"].to_numpy(dtype=float))
+        head_az_values.append(active["head_az_deg"].to_numpy(dtype=float))
+        head_el_values.append(active["head_el_deg"].to_numpy(dtype=float))
+
+    if not eye_az_values:
+        raise RuntimeError("No values collected for global bins")
+
+    return {
+        "eye_az": np.concatenate(eye_az_values),
+        "eye_el": np.concatenate(eye_el_values),
+        "head_az": np.concatenate(head_az_values),
+        "head_el": np.concatenate(head_el_values),
+    }
+
+
+def collect_values_from_sessions_loose(
+    blocks: pd.DataFrame,
+) -> dict[str, np.ndarray]:
+    """
+    Loose version:
+    collect all Bias/BiasJitter TrialActive frames from sessions appearing
+    in the balanced block table.
+
+    This matches the first script more closely but is less strict.
     """
     eye_az_values = []
     eye_el_values = []
@@ -227,7 +377,6 @@ def collect_values_for_global_bins(blocks: pd.DataFrame) -> dict[str, np.ndarray
             log(f"  Reading frame file {i}/{len(unique_sessions)}: {frame_path.name}")
 
         frames = pd.read_csv(frame_path)
-        
 
         active = frames[
             (frames["state"] == "TrialActive")
@@ -256,6 +405,9 @@ def collect_values_for_global_bins(blocks: pd.DataFrame) -> dict[str, np.ndarray
         head_az_values.append(active["head_az_deg"].to_numpy(dtype=float))
         head_el_values.append(active["head_el_deg"].to_numpy(dtype=float))
 
+    if not eye_az_values:
+        raise RuntimeError("No values collected for global bins")
+
     return {
         "eye_az": np.concatenate(eye_az_values),
         "eye_el": np.concatenate(eye_el_values),
@@ -265,7 +417,10 @@ def collect_values_for_global_bins(blocks: pd.DataFrame) -> dict[str, np.ndarray
 
 
 def make_global_bin_config(blocks: pd.DataFrame) -> dict[str, Any]:
-    values = collect_values_for_global_bins(blocks)
+    if STRICT_BALANCED_BINNING:
+        values = collect_values_from_exact_balanced_blocks(blocks)
+    else:
+        values = collect_values_from_sessions_loose(blocks)
 
     config = {
         "eye_az_edges": make_bin_edges(
@@ -297,7 +452,7 @@ def transfer_entropy_discrete(
     target_lag: int = 1,
 ) -> float:
     """
-    Histogram/discrete transfer entropy:
+    Discrete transfer entropy:
 
         TE source -> target =
         sum p(y_t, y_past, x_past)
@@ -307,8 +462,8 @@ def transfer_entropy_discrete(
                 p(y_t | y_past)
             )
 
-    This function aggregates transition counts across trials while avoiding
-    artificial transitions between the end of one trial and the start of the next.
+    Counts are aggregated across trials.
+    Trial boundaries are respected.
     """
     if len(source_trials) != len(target_trials):
         raise ValueError("source_trials and target_trials must have same length")
@@ -390,8 +545,10 @@ def shuffled_te_baseline(
     target_lag: int,
 ) -> np.ndarray:
     """
-    Shuffle source states within each trial to break temporal source-target
-    coupling while preserving the source state's marginal distribution.
+    Shuffle source states within each trial.
+
+    This preserves source state frequencies within each trial, but breaks
+    temporal alignment between source and target.
     """
     vals = []
 
@@ -423,17 +580,19 @@ def shuffled_te_baseline(
 def prepare_pairwise_state_trials(
     frames: pd.DataFrame,
     block_index: int,
+    layout: str,
     tracking: str,
     bin_config: dict[str, Any],
 ) -> tuple[list[np.ndarray], list[np.ndarray], dict[str, Any]]:
     """
-    Return:
-        eye_state_trials: list of arrays, one per trial
-        head_state_trials: list of arrays, one per trial
-        info: diagnostic metadata
+    Return eye/head 9-state yaw/pitch trial arrays for one exact block.
+
+    Important correction from the earlier script:
+    This filters by block_index AND layout AND tracking.
     """
     block = frames[
         (frames["block_index"] == block_index)
+        & (frames["layout"] == layout)
         & (frames["tracking"] == tracking)
         & (frames["state"] == "TrialActive")
     ].copy()
@@ -449,7 +608,7 @@ def prepare_pairwise_state_trials(
     }
 
     if block.empty:
-        info["skip_reason"] = "no_trialactive_rows"
+        info["skip_reason"] = "no_trialactive_rows_for_exact_block_layout_tracking"
         return [], [], info
 
     block = add_head_az_el(block)
@@ -501,7 +660,7 @@ def prepare_pairwise_state_trials(
 
     info["n_trials_used"] = len(eye_state_trials)
 
-    if len(trial_lengths) > 0:
+    if trial_lengths:
         info["min_trial_len"] = int(np.min(trial_lengths))
         info["max_trial_len"] = int(np.max(trial_lengths))
         info["mean_trial_len"] = float(np.mean(trial_lengths))
@@ -518,13 +677,8 @@ def run_te_for_block(
     head_state_trials: list[np.ndarray],
     rng: np.random.Generator,
 ) -> dict[str, Any]:
-    """
-    Compute raw TE, shuffled baseline, corrected TE, and approximate p-values
-    in both directions.
-    """
     out: dict[str, Any] = {}
 
-    # eye -> head
     eye_to_head = transfer_entropy_discrete(
         source_trials=eye_state_trials,
         target_trials=head_state_trials,
@@ -543,7 +697,6 @@ def run_te_for_block(
         target_lag=TARGET_LAG,
     )
 
-    # head -> eye
     head_to_eye = transfer_entropy_discrete(
         source_trials=head_state_trials,
         target_trials=eye_state_trials,
@@ -612,45 +765,50 @@ def compute_correlations(results_df: pd.DataFrame) -> pd.DataFrame:
         "head_to_eye_corrected_te",
     ]
 
+    outcomes = ["accuracy", "error_rate"]
+
     rows = []
 
-    for metric in metrics:
-        subset = results_df[["tracking", "layout", "accuracy", metric]].dropna()
+    for outcome in outcomes:
+        for metric in metrics:
+            subset = results_df[["tracking", "layout", outcome, metric]].dropna()
 
-        pearson_r, pearson_p, spearman_rho, spearman_p = safe_corr(
-            subset[metric],
-            subset["accuracy"],
-        )
-
-        rows.append(
-            {
-                "metric": metric,
-                "scope": "bias_modes",
-                "n_blocks": len(subset),
-                "pearson_r": pearson_r,
-                "pearson_p": pearson_p,
-                "spearman_rho": spearman_rho,
-                "spearman_p": spearman_p,
-            }
-        )
-
-        for tracking, tracking_df in subset.groupby("tracking"):
             pearson_r, pearson_p, spearman_rho, spearman_p = safe_corr(
-                tracking_df[metric],
-                tracking_df["accuracy"],
+                subset[metric],
+                subset[outcome],
             )
 
             rows.append(
                 {
                     "metric": metric,
-                    "scope": tracking,
-                    "n_blocks": len(tracking_df),
+                    "outcome": outcome,
+                    "scope": "bias_modes",
+                    "n_blocks": len(subset),
                     "pearson_r": pearson_r,
                     "pearson_p": pearson_p,
                     "spearman_rho": spearman_rho,
                     "spearman_p": spearman_p,
                 }
             )
+
+            for tracking, tracking_df in subset.groupby("tracking"):
+                pearson_r, pearson_p, spearman_rho, spearman_p = safe_corr(
+                    tracking_df[metric],
+                    tracking_df[outcome],
+                )
+
+                rows.append(
+                    {
+                        "metric": metric,
+                        "outcome": outcome,
+                        "scope": tracking,
+                        "n_blocks": len(tracking_df),
+                        "pearson_r": pearson_r,
+                        "pearson_p": pearson_p,
+                        "spearman_rho": spearman_rho,
+                        "spearman_p": spearman_p,
+                    }
+                )
 
     return pd.DataFrame(rows)
 
@@ -660,7 +818,7 @@ def compute_correlations(results_df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------
 
 def main() -> None:
-    log("Starting histogram-based pairwise yaw/pitch TE script")
+    log("Starting diagnostic histogram-based pairwise yaw/pitch TE script")
     log(f"Dataset root: {DATASET_ROOT}")
     log(f"Raw frames dir: {RAW_FRAMES_DIR}")
     log(f"Block summary: {BLOCK_SUMMARY_PATH}")
@@ -673,6 +831,14 @@ def main() -> None:
     blocks = block_summary[
         block_summary["tracking"].isin(TRACKING_MODES)
     ].copy()
+
+    blocks = validate_accuracy_column(blocks)
+
+    max_accuracy_diff = blocks["accuracy_abs_diff"].max()
+    log(f"Max |accuracy - correct_count / n_trials|: {max_accuracy_diff:.12f}")
+
+    if max_accuracy_diff > 1e-9:
+        log("WARNING: accuracy column does not perfectly match correct_count / n_trials")
 
     blocks = blocks.sort_values(
         ["participant_id", "layout", "tracking"]
@@ -694,12 +860,15 @@ def main() -> None:
 
     result_rows: list[dict[str, Any]] = []
 
+    # Cache frame files for the main loop as well.
+    frame_cache: dict[str, pd.DataFrame] = {}
+
     for i, row in blocks.iterrows():
         participant_id = row["participant_id"]
         layout = row["layout"]
         tracking = row["tracking"]
 
-        block_index = int(row["condition_block_key"].split("#block=")[1].split("#")[0])
+        block_index = parse_block_index(row["condition_block_key"])
         source_session_id = parse_source_session_id(row["source_sessions"])
         frame_path = frame_path_from_session_id(source_session_id)
 
@@ -714,12 +883,16 @@ def main() -> None:
             "source_session_id": source_session_id,
             "block_index": block_index,
             "accuracy": row["accuracy"],
+            "computed_accuracy": row["computed_accuracy"],
+            "accuracy_abs_diff": row["accuracy_abs_diff"],
+            "error_rate": 1.0 - row["accuracy"],
             "correct_count": row["correct_count"],
             "n_trials_expected": row["n_trials"],
             "frame_path": str(frame_path),
             "n_bins_per_dim": N_BINS_PER_DIM,
             "n_states": N_STATES,
             "binning_method": BINNING_METHOD,
+            "strict_balanced_binning": STRICT_BALANCED_BINNING,
             "source_lag": SOURCE_LAG,
             "target_lag": TARGET_LAG,
         }
@@ -735,11 +908,24 @@ def main() -> None:
             result_rows.append(base_row)
             continue
 
-        frames = pd.read_csv(frame_path)
+        if source_session_id not in frame_cache:
+            frame_cache[source_session_id] = pd.read_csv(frame_path)
+
+        frames = frame_cache[source_session_id]
+
+        diagnostic_info = diagnose_frame_match(
+            frames=frames,
+            block_index=block_index,
+            layout=layout,
+            tracking=tracking,
+            expected_n_trials=int(row["n_trials"]),
+        )
+        base_row.update(diagnostic_info)
 
         eye_state_trials, head_state_trials, info = prepare_pairwise_state_trials(
             frames=frames,
             block_index=block_index,
+            layout=layout,
             tracking=tracking,
             bin_config=bin_config,
         )
@@ -779,7 +965,7 @@ def main() -> None:
     results_df = pd.DataFrame(result_rows)
 
     suffix = (
-        f"pairwise_2d_{N_BINS_PER_DIM}x{N_BINS_PER_DIM}_"
+        f"diagnostic_pairwise_2d_{N_BINS_PER_DIM}x{N_BINS_PER_DIM}_"
         f"{BINNING_METHOD}_lag{SOURCE_LAG}_shuffle{N_SHUFFLES}"
     )
 
@@ -787,11 +973,32 @@ def main() -> None:
     results_df.to_csv(results_path, index=False)
     log(f"\nSaved block TE results to: {results_path}")
 
-    corr_df = compute_correlations(results_df[results_df["status"] == "ok"].copy())
+    ok_df = results_df[results_df["status"] == "ok"].copy()
+
+    corr_df = compute_correlations(ok_df)
 
     corr_path = OUTPUT_DIR / f"histogram_te_accuracy_correlations_{suffix}.csv"
     corr_df.to_csv(corr_path, index=False)
-    log(f"Saved TE-accuracy correlations to: {corr_path}")
+    log(f"Saved TE correlations to: {corr_path}")
+
+    diagnostic_summary = {
+        "n_rows": int(len(results_df)),
+        "n_ok": int((results_df["status"] == "ok").sum()),
+        "n_skipped": int((results_df["status"] != "ok").sum()),
+        "n_expected_match_missing": int(
+            (~results_df["diagnostic_expected_match_found"].fillna(False)).sum()
+        ),
+        "n_trial_count_mismatch": int(
+            (~results_df["diagnostic_trial_count_matches"].fillna(False)).sum()
+        ),
+        "max_accuracy_abs_diff": float(results_df["accuracy_abs_diff"].max()),
+    }
+
+    diagnostic_path = OUTPUT_DIR / f"histogram_te_diagnostic_summary_{suffix}.json"
+    with diagnostic_path.open("w", encoding="utf-8") as f:
+        json.dump(diagnostic_summary, f, indent=2)
+
+    log(f"Saved diagnostic summary to: {diagnostic_path}")
 
     settings_path = OUTPUT_DIR / f"histogram_te_settings_{suffix}.json"
     with settings_path.open("w", encoding="utf-8") as f:
@@ -801,6 +1008,7 @@ def main() -> None:
                 "n_bins_per_dim": N_BINS_PER_DIM,
                 "n_states": N_STATES,
                 "binning_method": BINNING_METHOD,
+                "strict_balanced_binning": STRICT_BALANCED_BINNING,
                 "source_lag": SOURCE_LAG,
                 "target_lag": TARGET_LAG,
                 "min_samples_per_trial": MIN_SAMPLES_PER_TRIAL,
@@ -816,6 +1024,9 @@ def main() -> None:
         )
 
     log(f"Saved settings to: {settings_path}")
+
+    log("\nDiagnostic summary:")
+    log(json.dumps(diagnostic_summary, indent=2))
 
     log("\nCorrelation preview:")
     if corr_df.empty:
