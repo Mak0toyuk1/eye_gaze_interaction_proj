@@ -42,7 +42,15 @@ TRACKING_MODES = ["Bias", "BiasJitter"]
 
 # Start with one-dimensional azimuth signals. Later we can repeat with
 # elevation or angular velocity.
-SIGNAL_COMPONENT = "az"  # options: "az", "el"
+# SIGNAL_COMPONENT = "az"  # options: "az", "el"
+
+# Signal choices:
+# "az_position" = raw eye azimuth vs computed head azimuth
+# "el_position" = raw eye elevation vs computed head elevation
+# "az_velocity" = frame-to-frame change in eye azimuth vs head azimuth
+# "el_velocity" = frame-to-frame change in eye elevation vs head elevation
+SIGNAL_MODE = "az_velocity"
+
 
 MIN_SAMPLES_PER_TRIAL = 30
 
@@ -149,20 +157,24 @@ def add_head_az_el(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def get_signal_columns(component: str) -> tuple[str, str]:
+def get_signal_columns(signal_mode: str) -> tuple[str, str, bool]:
     """
-    Return eye column and head column.
-
-    For the first replication attempt:
-    - eye signal: raw gaze panel azimuth/elevation
-    - head signal: head azimuth/elevation computed from head quaternion
+    Return eye column, head column, and whether to convert positions into
+    frame-to-frame velocity/change signals.
     """
-    if component == "az":
-        return "raw_panel_az_deg", "head_az_deg"
-    if component == "el":
-        return "raw_panel_el_deg", "head_el_deg"
+    if signal_mode == "az_position":
+        return "raw_panel_az_deg", "head_az_deg", False
 
-    raise ValueError(f"Unsupported SIGNAL_COMPONENT: {component}")
+    if signal_mode == "el_position":
+        return "raw_panel_el_deg", "head_el_deg", False
+
+    if signal_mode == "az_velocity":
+        return "raw_panel_az_deg", "head_az_deg", True
+
+    if signal_mode == "el_velocity":
+        return "raw_panel_el_deg", "head_el_deg", True
+
+    raise ValueError(f"Unsupported SIGNAL_MODE: {signal_mode}")
 
 
 def prepare_block_array(
@@ -182,7 +194,7 @@ def prepare_block_array(
     replications = trials
     """
 
-    eye_col, head_col = get_signal_columns(component)
+    eye_col, head_col, use_velocity = get_signal_columns(component)
 
     block = frames[
         (frames["block_index"] == block_index)
@@ -228,6 +240,9 @@ def prepare_block_array(
         valid = np.isfinite(eye) & np.isfinite(head)
         eye = eye[valid]
         head = head[valid]
+        if use_velocity:
+            eye = np.diff(eye)
+            head = np.diff(head)
 
         if len(eye) >= MIN_SAMPLES_PER_TRIAL:
             trial_arr = np.vstack([eye, head])
@@ -514,7 +529,7 @@ def main() -> None:
             "correct_count": row["correct_count"],
             "n_trials_expected": row["n_trials"],
             "frame_path": str(frame_path),
-            "signal_component": SIGNAL_COMPONENT,
+            "signal_component": SIGNAL_MODE,
         }
 
         if not frame_path.exists():
@@ -537,7 +552,7 @@ def main() -> None:
             frames=frames,
             block_index=block_index,
             tracking=tracking,
-            component=SIGNAL_COMPONENT,
+            component=SIGNAL_MODE,
         )
 
         base_row.update(info)
@@ -598,8 +613,10 @@ def main() -> None:
 
     results_df = pd.DataFrame(result_rows)
 
-    results_path = OUTPUT_DIR / "idtxl_te_block_results.csv"
+    suffix = f"{SIGNAL_MODE}_full"
+    results_path = OUTPUT_DIR / f"idtxl_te_block_results_{suffix}.csv"
     results_df.to_csv(results_path, index=False)
+
 
     log(f"\nSaved block TE results to: {results_path}")
 
@@ -609,26 +626,27 @@ def main() -> None:
 
     log(f"Saved raw IDTxl result objects to: {pickle_path}")
 
-    settings_path = OUTPUT_DIR / "idtxl_te_settings.json"
+    
+    settings_path = OUTPUT_DIR / f"idtxl_te_settings_{suffix}.json"
     with settings_path.open("w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "tracking_modes": TRACKING_MODES,
-                "signal_component": SIGNAL_COMPONENT,
-                "min_samples_per_trial": MIN_SAMPLES_PER_TRIAL,
-                "max_blocks": MAX_BLOCKS,
-                "idtxl_settings": IDTXL_SETTINGS,
-            },
-            f,
-            indent=2,
-        )
+            json.dump(
+        {
+            "tracking_modes": TRACKING_MODES,
+            "signal_mode": SIGNAL_MODE,
+            "min_samples_per_trial": MIN_SAMPLES_PER_TRIAL,
+            "max_blocks": MAX_BLOCKS,
+            "idtxl_settings": IDTXL_SETTINGS,
+        },
+        f,
+        indent=2,
+    )
 
     log(f"Saved settings to: {settings_path}")
 
     ok_df = results_df[results_df["status"].isin(["ok", "idtxl_partial_or_failed"])].copy()
     corr_df = compute_correlations(ok_df)
 
-    corr_path = OUTPUT_DIR / "idtxl_te_accuracy_correlations.csv"
+    corr_path = OUTPUT_DIR / f"idtxl_te_accuracy_correlations_{suffix}.csv"
     corr_df.to_csv(corr_path, index=False)
 
     log(f"Saved TE-accuracy correlations to: {corr_path}")
